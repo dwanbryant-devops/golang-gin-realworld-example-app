@@ -98,18 +98,22 @@ jobs:
             -e JWT_SECRET="ci-only-secret" \
             ${{ env.IMAGE_NAME }}:ci
           for i in $(seq 1 30); do curl -sf http://localhost:8080/api/ping/ && break; sleep 1; done
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-      - name: RealWorld Postman suite
+      # Official RealWorld API conformance suite (Hurl), pinned to a spec commit so the
+      # tests only change when we bump REALWORLD_SPEC_SHA.
+      - name: RealWorld API spec (Hurl)
+        env:
+          REALWORLD_SPEC_SHA: ffbd690089f05193733b20ee4ee98087892f714e
+          HURL_VERSION: 8.0.1
         run: |
-          curl -sL https://raw.githubusercontent.com/gothinkster/realworld/main/api/Conduit.postman_collection.json -o conduit.json
-          npx --yes newman run conduit.json \
-            --global-var "APIURL=http://localhost:8080/api" \
-            --global-var "EMAIL=ci-$(date +%s)@example.com" \
-            --global-var "PASSWORD=password" \
-            --global-var "USERNAME=ci$(date +%s)" \
-            --delay-request 20
+          mkdir spec
+          curl -sfL "https://codeload.github.com/realworld-apps/realworld/tar.gz/$REALWORLD_SPEC_SHA" \
+            | tar xz -C spec --strip-components=4 --wildcards '*/specs/api/hurl/*.hurl'
+          files=$(cd spec && ls *.hurl | sed 's|^|/tests/|')
+          docker run --rm --network host -v "$PWD/spec:/tests:ro" "ghcr.io/orange-opensource/hurl:$HURL_VERSION" \
+            --test --jobs 1 --color \
+            --variable host=http://localhost:8080 \
+            --variable uid="ci$(date +%s)" \
+            $files
       - name: Metrics endpoint exposes app series
         run: curl -sf http://localhost:8080/metrics | grep -q http_requests_total
       - if: failure()
