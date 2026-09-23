@@ -4,7 +4,9 @@ package common
 import (
 	"crypto/rand"
 	"fmt"
+	"log"
 	"math/big"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -37,9 +39,24 @@ func RandInt() int {
 	return int(randNum.Int64())
 }
 
-// Keep this two config private, it should not expose to open source
-const JWTSecret = "A String Very Very Very Strong!!@##$!@#$"      // #nosec G101
+// devJWTSecret is only for local runs and tests; deployed environments set JWT_SECRET.
+const devJWTSecret = "A String Very Very Very Strong!!@##$!@#$" // #nosec G101
+
+// JWTSecret signs and verifies tokens. In release mode (GIN_MODE=release) it must
+// come from the environment, so the dev value can never be used in a deployment.
+var JWTSecret = loadJWTSecret()
+
 const RandomPassword = "A String Very Very Very Random!!@##$!@#4" // #nosec G101
+
+func loadJWTSecret() string {
+	if s := os.Getenv("JWT_SECRET"); s != "" {
+		return s
+	}
+	if os.Getenv("GIN_MODE") == gin.ReleaseMode {
+		log.Fatal("JWT_SECRET must be set when GIN_MODE=release")
+	}
+	return devJWTSecret
+}
 
 // A Util function to generate jwt_token which can be used in the request header
 func GenToken(id uint) string {

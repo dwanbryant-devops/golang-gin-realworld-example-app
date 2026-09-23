@@ -1,6 +1,7 @@
 package articles
 
 import (
+	"encoding/json"
 	"errors"
 	"github.com/gin-gonic/gin"
 	"github.com/gothinkster/golang-gin-realworld-example-app/common"
@@ -8,6 +9,7 @@ import (
 	"gorm.io/gorm"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 func ArticlesRegister(router *gin.RouterGroup) {
@@ -47,6 +49,7 @@ func ArticleCreate(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, common.NewError("database", err))
 		return
 	}
+	common.CacheDelete(tagsCacheKey)
 	serializer := ArticleSerializer{c, articleModelValidator.articleModel}
 	c.JSON(http.StatusCreated, gin.H{"article": serializer.Response()})
 }
@@ -240,12 +243,27 @@ func ArticleCommentList(c *gin.Context) {
 	serializer := CommentsSerializer{c, articleModel.Comments}
 	c.JSON(http.StatusOK, gin.H{"comments": serializer.Response()})
 }
+
+// tagsCacheKey holds the serialized tag list; tags only change when articles are
+// written, so a short TTL plus invalidation on writes keeps it fresh.
+const tagsCacheKey = "tags"
+
 func TagList(c *gin.Context) {
+	if body, ok := common.CacheGet(tagsCacheKey); ok {
+		c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+		return
+	}
 	tagModels, err := getAllTags()
 	if err != nil {
 		c.JSON(http.StatusNotFound, common.NewError("articles", errors.New("Invalid param")))
 		return
 	}
 	serializer := TagsSerializer{c, tagModels}
-	c.JSON(http.StatusOK, gin.H{"tags": serializer.Response()})
+	body, err := json.Marshal(gin.H{"tags": serializer.Response()})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, common.NewError("tags", err))
+		return
+	}
+	common.CacheSet(tagsCacheKey, body, time.Minute)
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
 }
