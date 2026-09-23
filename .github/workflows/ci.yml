@@ -1,132 +1,224 @@
+# API pipeline
+#   PR:          unit tests -> image build + scan -> API tests vs Postgres -> perf regression vs base branch
+#   push main:   same tests -> push image to ECR (OIDC, `dev` environment) -> bump tag in incode-gitops
+#                -> Argo CD rolls it out.
 name: CI
 
 on:
-  push:
-    branches: [ master, main ]
   pull_request:
-    branches: [ master, main ]
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE_NAME: incode/api
+  AWS_REGION: us-east-1
 
 jobs:
   test:
-    name: Test
+    name: Unit tests
     runs-on: ubuntu-latest
-    
-    permissions:
-      contents: read
-      pull-requests: write
-    
-    strategy:
-      matrix:
-        go-version: ['1.21', '1.22', '1.23']
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: ${{ matrix.go-version }}
-    
-    - name: Get dependencies
-      run: |
-        go get -v -t -d ./...
-        go mod download
-        go mod verify
-    
-    - name: Run gofmt check
-      run: bash ./scripts/gofmt.sh
-    
-    - name: Run tests with coverage
-      run: bash ./scripts/coverage.sh
-    
-    - name: Upload coverage to Coveralls
-      if: matrix.go-version == '1.23'
-      uses: coverallsapp/github-action@v2
-      with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./coverage.out
-        format: golang
-        flag-name: go-${{ matrix.go-version }}
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: bash ./scripts/gofmt.sh
+      - name: go vet
+        run: go vet ./...
+      - name: Tests (race detector, coverage)
+        run: go test -race -coverprofile=coverage.out ./...
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1 >> "$GITHUB_STEP_SUMMARY"
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
-  lint:
-    name: Lint
+  image:
+    name: Build + scan image
     runs-on: ubuntu-latest
-    
-    permissions:
-      contents: read
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23'
-    
-    - name: Run golangci-lint
-      uses: golangci/golangci-lint-action@v4
-      with:
-        version: v1.61
-        args: --timeout=5m
-
-  security:
-    name: Security Scan
-    runs-on: ubuntu-latest
-    
-    permissions:
-      contents: read
-      security-events: write
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23'
-    
-    - name: Run Gosec Security Scanner
-      uses: securego/gosec@v2.21.4
-      with:
-        args: '-no-fail -fmt sarif -out results.sarif ./...'
-    
-    - name: Upload SARIF file
-      if: always()
-      uses: github/codeql-action/upload-sarif@v3
-      with:
-        sarif_file: results.sarif
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Trivy scan (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Save image
+        run: docker save ${{ env.IMAGE_NAME }}:ci | gzip > image.tar.gz
+      - uses: actions/upload-artifact@v7
+        with:
+          name: api-image
+          path: image.tar.gz
+          retention-days: 1
 
   api-test:
-    name: API Integration Test
+    name: API tests (image + Postgres)
+    needs: image
     runs-on: ubuntu-latest
-    
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: realworld
+          POSTGRES_PASSWORD: realworld
+          POSTGRES_DB: realworld
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U realworld" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: api-image
+      - run: docker load < image.tar.gz
+      - name: Start API container
+        run: |
+          docker run -d --name api --network host \
+            -e DATABASE_URL="postgres://realworld:realworld@localhost:5432/realworld?sslmode=disable" \
+            -e JWT_SECRET="ci-only-secret" \
+            ${{ env.IMAGE_NAME }}:ci
+          for i in $(seq 1 30); do curl -sf http://localhost:8080/api/ping/ && break; sleep 1; done
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      # RealWorld API conformance suite, pinned to the spec version this app implements
+      # (the Postman collection as of the app's last upstream update). The newer "v2" spec
+      # (Hurl) changes response shapes; adopting it is app work, tracked in the README.
+      - name: RealWorld API suite (Postman, pinned)
+        env:
+          REALWORLD_SPEC_SHA: dedb6969fe2e025ccac06464f01bc25584d9290c
+        run: |
+          curl -sfL "https://raw.githubusercontent.com/realworld-apps/realworld/$REALWORLD_SPEC_SHA/api/Conduit.postman_collection.json" -o conduit.json
+          npx --yes newman run conduit.json \
+            --global-var "APIURL=http://localhost:8080/api" \
+            --global-var "EMAIL=ci-$(date +%s)@example.com" \
+            --global-var "PASSWORD=password" \
+            --global-var "USERNAME=ci$(date +%s)" \
+            --delay-request 20
+      - name: Metrics endpoint exposes app series
+        run: curl -sf http://localhost:8080/metrics | grep -q http_requests_total
+      - if: failure()
+        run: docker logs api
+
+  perf:
+    name: Performance regression (vs base branch)
+    if: github.event_name == 'pull_request'
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: head
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - uses: actions/download-artifact@v8
+        with:
+          name: api-image
+      - uses: docker/setup-buildx-action@v4
+      - name: Load head image, build base image
+        id: base
+        run: |
+          docker load < image.tar.gz
+          docker tag $IMAGE_NAME:ci api:head
+          if [ -f base/Dockerfile ]; then
+            docker build -t api:base base
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Base branch has no Dockerfile yet; no baseline to compare." >> "$GITHUB_STEP_SUMMARY"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run k6 against each build (fresh Postgres per run)
+        if: steps.base.outputs.available == 'true'
+        run: |
+          docker network create perf
+          chmod 777 head/perf # k6 runs as a non-root user and writes summaries here
+          for v in base head; do
+            docker rm -f pg api >/dev/null 2>&1 || true
+            docker run -d --name pg --network perf -e POSTGRES_USER=rw -e POSTGRES_PASSWORD=rw -e POSTGRES_DB=rw postgres:18
+            until docker exec pg pg_isready -U rw >/dev/null 2>&1; do sleep 1; done
+            docker run -d --name api --network perf \
+              -e DATABASE_URL="postgres://rw:rw@pg:5432/rw?sslmode=disable" -e JWT_SECRET=perf \
+              api:$v
+            until docker run --rm --network perf curlimages/curl -sf http://api:8080/api/ping/ >/dev/null; do sleep 1; done
+            docker run --rm --network perf -v "$PWD/head/perf:/perf" -e API_URL=http://api:8080/api \
+              grafana/k6 run --quiet --summary-export /perf/$v.json /perf/load.js
+          done
+      - name: Compare
+        if: steps.base.outputs.available == 'true'
+        run: python3 head/perf/compare.py head/perf/base.json head/perf/head.json
+
+  publish:
+    name: Push image to ECR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, api-test]
+    runs-on: ubuntu-latest
+    environment: dev # holds AWS_ROLE_ARN; restricted to main, so the OIDC sub is environment:dev
     permissions:
       contents: read
-    
+      id-token: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.23'
-        
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
+      - uses: actions/download-artifact@v8
+        with:
+          name: api-image
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Push (tags are immutable in ECR)
+        run: |
+          docker load < image.tar.gz
+          REF="${{ steps.ecr.outputs.registry }}/$IMAGE_NAME:${{ steps.meta.outputs.tag }}"
+          docker tag $IMAGE_NAME:ci "$REF"
+          docker push "$REF"
+          echo "Pushed \`$REF\`" >> "$GITHUB_STEP_SUMMARY"
 
-    - name: Install Newman
-      run: npm install -g newman
-
-    - name: Get dependencies
-      run: |
-        go get -v -t -d ./...
-        go mod download
-    
-    - name: Run API Tests
-      run: bash ./scripts/run-api-tests.sh
+  deploy-dev:
+    name: Deploy to dev (GitOps)
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency: gitops-dev # serialize tag bumps with the UI pipeline
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: dwanbryant-devops/incode-gitops
+          ssh-key: ${{ secrets.GITOPS_DEPLOY_KEY }}
+          path: gitops
+      - name: Bump api image tag
+        working-directory: gitops
+        run: |
+          TAG="${{ needs.publish.outputs.tag }}"
+          yq -i ".api.image.tag = \"$TAG\"" values/dev/realworld.yaml
+          git config user.name "incode-ci"
+          git config user.email "ci@users.noreply.github.com"
+          git commit -am "dev: api -> $TAG (${GITHUB_REPOSITORY}@${GITHUB_SHA::12})"
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 3; done
+          echo "Argo CD will roll out \`$TAG\` to dev." >> "$GITHUB_STEP_SUMMARY"

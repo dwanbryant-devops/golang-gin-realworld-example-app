@@ -1,0 +1,8 @@
+.git
+.github
+data
+tmp
+perf
+*.md
+*.db
+coverage.out

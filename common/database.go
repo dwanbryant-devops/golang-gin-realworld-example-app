@@ -2,9 +2,12 @@ package common
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"time"
 
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -46,16 +49,30 @@ func ensureDir(filePath string) error {
 }
 
 // Opening a database and save the reference to `Database` struct.
+// If DATABASE_URL is set (e.g. postgres://user:pass@host:5432/db?sslmode=require)
+// Postgres is used; otherwise a local SQLite file at DB_PATH.
 func Init() *gorm.DB {
-	dbPath := GetDBPath()
+	var dialector gorm.Dialector
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn != "" {
+		dialector = postgres.Open(dsn)
+	} else {
+		dbPath := GetDBPath()
 
-	// Ensure the directory exists
-	if err := ensureDir(dbPath); err != nil {
-		fmt.Println("db err: (Init - create dir) ", err)
+		// Ensure the directory exists
+		if err := ensureDir(dbPath); err != nil {
+			fmt.Println("db err: (Init - create dir) ", err)
+		}
+		dialector = sqlite.Open(dbPath)
 	}
 
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	db, err := gorm.Open(dialector, &gorm.Config{})
 	if err != nil {
+		// Deployed (Postgres): fail fast so Kubernetes restarts the pod and the rollout
+		// stalls visibly. Local SQLite keeps the original log-and-continue behavior.
+		if dsn != "" {
+			log.Fatal("db err: (Init) ", err)
+		}
 		fmt.Println("db err: (Init) ", err)
 	}
 	sqlDB, err := db.DB()
@@ -63,6 +80,8 @@ func Init() *gorm.DB {
 		fmt.Println("db err: (Init - get sql.DB) ", err)
 	} else {
 		sqlDB.SetMaxIdleConns(10)
+		sqlDB.SetMaxOpenConns(25)
+		sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	}
 	DB = db
 	return DB

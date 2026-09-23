@@ -1,8 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -30,13 +36,20 @@ func main() {
 		log.Println("failed to get sql.DB:", err)
 	} else {
 		defer sqlDB.Close()
+		common.RegisterDBMetrics(sqlDB, "realworld")
 	}
+	common.InitCache()
 
 	r := gin.Default()
+	r.Use(common.MetricsMiddleware())
 
 	// Disable automatic redirect for trailing slashes
 	// This prevents POST body from being lost during redirects
 	r.RedirectTrailingSlash = false
+
+	// Prometheus scrape endpoint. Not routed by the ALB (only /api and / are), so
+	// it's reachable only inside the cluster.
+	r.GET("/metrics", common.MetricsHandler())
 
 	v1 := r.Group("/api")
 	users.UsersRegister(v1.Group("/users"))
@@ -64,7 +77,26 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	if err := r.Run(":" + port); err != nil {
-		log.Fatal("failed to start server:", err)
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal("failed to start server:", err)
+		}
+	}()
+
+	// On SIGTERM (pod shutdown) stop accepting connections and let in-flight
+	// requests finish, so rolling deploys don't drop requests.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Println("graceful shutdown failed:", err)
 	}
 }
