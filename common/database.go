@@ -53,7 +53,8 @@ func ensureDir(filePath string) error {
 // Postgres is used; otherwise a local SQLite file at DB_PATH.
 func Init() *gorm.DB {
 	var dialector gorm.Dialector
-	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn != "" {
 		dialector = postgres.Open(dsn)
 	} else {
 		dbPath := GetDBPath()
@@ -67,7 +68,12 @@ func Init() *gorm.DB {
 
 	db, err := gorm.Open(dialector, &gorm.Config{})
 	if err != nil {
-		log.Fatal("db err: (Init) ", err)
+		// Deployed (Postgres): fail fast so Kubernetes restarts the pod and the rollout
+		// stalls visibly. Local SQLite keeps the original log-and-continue behavior.
+		if dsn != "" {
+			log.Fatal("db err: (Init) ", err)
+		}
+		fmt.Println("db err: (Init) ", err)
 	}
 	sqlDB, err := db.DB()
 	if err != nil {
